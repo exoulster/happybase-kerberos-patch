@@ -12,7 +12,8 @@ from six.moves import queue, range
 from thriftpy2.thrift import TClient, TException
 from thriftpy2.transport.buffered import TBufferedTransport
 from thriftpy2.transport.framed import TFramedTransport
-from thriftpy2.transport import TSocket, TTransportBase, TTransportException, readall
+from thriftpy2.transport import TSocket, TTransportBase, TTransportException
+from thriftpy2.transport.base import readall
 from thriftpy2.protocol.binary import TBinaryProtocol
 from thriftpy2.protocol.compact import TCompactProtocol
 
