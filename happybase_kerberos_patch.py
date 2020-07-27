@@ -27,6 +27,9 @@ from Hbase_thrift import Hbase
 import kerberos
 from kerberos import KrbError
 
+import time
+from datetime import datetime
+
 logger = logging.getLogger(__name__)
 
 
@@ -232,9 +235,10 @@ class KerberosConnection(Connection):
 
     def _refresh_thrift_client(self):
         """Refresh the Thrift socket, transport, and client."""
-        socket = TSocket(self.host, self.port)
-        if self.timeout is not None:
-            socket.set_timeout(self.timeout)
+        # socket = TSocket(self.host, self.port)
+        socket = TSocket(host=self.host, port=self.port, socket_timeout=self.timeout)
+        # if self.timeout is not None:
+            # socket.set_timeout(self.timeout)
 
         self.transport = self._transport_class(socket)
         if self.use_kerberos:
@@ -243,26 +247,8 @@ class KerberosConnection(Connection):
         self.client = TClient(Hbase, protocol)
 
 
-class NoHostsAvailable(RuntimeError):
-    """
-    Exception raised when no hosts specified in KerberosConnectionPool are available.
-    """
-    pass
-
 class KerberosConnectionPool(ConnectionPool):
-    """
-    similar to `happybase.ConnectionPool` with the following extra features
-    1. support multiple specify multiple hosts as destination to connection as
-        a support to high avaliable
-    2. pool will auto connect to the next host if current is unavailable even in
-        the outermost with statement
-    """
-    def __init__(self, size, hosts=None, **kwargs):
-        '''
-            hosts: 
-                A list of hosts or a string of hosts seperated by ","
-                This parameter works only if host is not specified
-        '''
+    def __init__(self, size, **kwargs):
         if not isinstance(size, int):
             raise TypeError("Pool 'size' arg must be an integer")
 
@@ -273,30 +259,15 @@ class KerberosConnectionPool(ConnectionPool):
             "Initializing connection pool with %d connections", size)
 
         self._lock = threading.Lock()
-        self._host_queue_map = {}
+        self._queue = queue.LifoQueue(maxsize=size)
         self._thread_connections = threading.local()
 
         connection_kwargs = kwargs
         connection_kwargs['autoconnect'] = False
 
-        if kwargs.get('host'):
-            self._hosts = [kwargs.get('host')]
-        else:
-            if isinstance(hosts, list):
-                self._hosts = hosts
-            elif isinstance(hosts, six.text_type):
-                self._hosts = hosts.split(',')
-            else:
-                raise Exception('error hosts type')
-
-        for host in self._hosts:
-            self._host_queue_map[host] = queue.LifoQueue(maxsize=size)
-            connection_kwargs['host'] = host
-
-            for i in range(size):
-                connection = KerberosConnection(**connection_kwargs)
-                self._host_queue_map[host].put(connection)
-                # self._queue.put(connection)
+        for i in range(size):
+            connection = KerberosConnection(**connection_kwargs)
+            self._queue.put(connection)
 
         # The first connection is made immediately so that trivial
         # mistakes like unresolvable host names are raised immediately.
@@ -304,80 +275,21 @@ class KerberosConnectionPool(ConnectionPool):
         with self.connection():
             pass
 
-    def _acquire_connection(self, host, timeout=None):
-        """Acquire a connection from the pool."""
+        # keep alive in a separate thread by running conn.tables()
         try:
-            return self._host_queue_map[host].get(True, timeout)
-        except queue.Empty:
-            raise NoConnectionsAvailable(
-                "No connection available from pool within specified "
-                "timeout")
+            self.thread = threading.Thread(target=self.keep_alive)
+            self.thread.daemon = True
+            self.thread.start()
+        except (KeyboardInterrupt, SystemExit) as e:
+            pass
 
-    def _return_connection(self, host, connection):
-        """Return a connection to the pool."""
-        self._host_queue_map[host].put(connection)
-
-    @contextlib.contextmanager
-    def connection(self, timeout=None):
-        for host in self._hosts:
-            connection = getattr(self._thread_connections, 'current', None)
-            # whether in the outermost `with` context
-            is_outermost_with = False
-            # whether the exception raised in ``with`` block, not include ``with`` statement
-            is_in_with = False
-            # whether to retry next host
-            is_continue = False
-            if connection is None:
-                # This is the outermost connection requests for this thread.
-                # Obtain a new connection from the pool and keep a reference
-                # in a thread local so that nested connection requests from
-                # the same thread can return the same connection instance.
-                # Note: this code acquires a lock before assigning to the
-                #
-                # thread local; see
-                # http://emptysquare.net/blog/another-thing-about-pythons-
-                # threadlocals/
-                is_outermost_with = True
-                connection = self._acquire_connection(host, timeout)
-                with self._lock:
-                    self._thread_connections.current = connection
-
-            try:
-                # Open connection, because connections are opened lazily.
-                # This is a no-op for connections that are already open.
-                # import ipdb; ipdb.set_trace()
-                connection.open()
-                is_in_with = True
-                # Return value from the context manager's __enter__()
-                yield connection
-
-            except (TException, socket.error, KrbError) as e:
-                # Refresh the underlying Thrift client if an exception
-                # occurred in the Thrift layer, since we don't know whether
-                # the connection is still usable.
-                logger.info("Replacing tainted pool connection")
-                logger.error("{} error when connect to {}".format(str(e), host))
-                # don't try to open the new connection here because even if 
-                # the new connection's `connection.open` failed, the 
-                # `connection.transport.is_open` still returns `True` which
-                # results in success of the next invoking of `connection.open` 
-                # in `with pool.connection()` even if the host is still unaccessible.
-                connection._refresh_thrift_client()
-                if is_outermost_with and not is_in_with:
-                    # only retry to connect to next host during the outermost `with` statement
-                    is_continue = True
-                else:
-                    raise
-            finally:
-                # Remove thread local reference after the outermost 'with'
-                # block ends. Afterwards the thread no longer owns the
-                # connection.
-                if is_outermost_with:
-                    del self._thread_connections.current
-                    self._return_connection(host, connection)
-            if not is_continue:
-                break
-        else:
-            raise NoHostsAvailable(
-                "No available host connection available from pool within specified "
-                "timeout")
+    def keep_alive(self, interval=1):
+        while True:
+            with self.connection() as conn:
+                try:
+                    conn.tables()
+                except TTransportException as e:
+                    # TTransportException: TTransportException(type=4, message='TSocket read 0 bytes')
+                    conn._refresh_thrift_client()
+                    conn.close()
+            time.sleep(interval)
